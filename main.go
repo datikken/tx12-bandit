@@ -21,6 +21,15 @@ const (
 	CRSFMin    = 172
 	CRSFCenter = 992
 	CRSFMax    = 1811
+
+	// CRSF frame.
+	CRSFAddress = 0xC8
+	CRSFTypeRC  = 0x16
+
+	// CRSF RC Channels Packed:
+	// 16 channels × 11 bits = 176 bits = 22 bytes.
+	CRSFPayloadSize = 22
+	CRSFFrameSize   = 26
 )
 
 type HIDReport struct {
@@ -76,14 +85,10 @@ func parseReport(buf []byte) HIDReport {
 // ------------------------------------------------------------
 // HID 0..2047 -> CRSF 172..1811
 //
-// При HID:
-//
-// 0    -> 172
-// 1024 -> 992
-// 2047 -> 1811
-//
-// Делим диапазон относительно центра, чтобы нейтраль TX12
-// корректно попадала примерно в CRSF center = 992.
+// HID:
+//   0    -> 172
+//   1024 -> 992
+//   2047 -> 1811
 // ------------------------------------------------------------
 
 func hidToCRSF(v uint16) uint16 {
@@ -101,10 +106,7 @@ func hidToCRSF(v uint16) uint16 {
 }
 
 // ------------------------------------------------------------
-// CRSF CRC-8
-//
-// Polynomial: 0xD5
-// CRC считается от TYPE + PAYLOAD.
+// CRSF CRC-8/D5
 // ------------------------------------------------------------
 
 func crc8(data []byte) byte {
@@ -126,22 +128,20 @@ func crc8(data []byte) byte {
 }
 
 // ------------------------------------------------------------
-// CRSF RC Channels Packed
+// Упаковка 16 × 11 bit.
 //
-// Frame:
+// CRSF RC Channels Packed:
 //
-// 0     ADDRESS      C8
-// 1     LENGTH       18
-// 2     TYPE         16
-// 3..24 PAYLOAD      22 bytes
-// 25    CRC
+// CH1  = bits 0..10
+// CH2  = bits 11..21
+// ...
+// CH16 = bits 165..175
 //
-// Payload:
-// 16 channels × 11 bits = 176 bits = 22 bytes
+// Всего 176 бит = 22 байта.
 // ------------------------------------------------------------
 
-func makeCRSF(channels [16]uint16) []byte {
-	payload := make([]byte, 22)
+func packChannels(channels [16]uint16) [CRSFPayloadSize]byte {
+	var payload [CRSFPayloadSize]byte
 
 	bitPos := 0
 
@@ -160,46 +160,169 @@ func makeCRSF(channels [16]uint16) []byte {
 		}
 	}
 
-	// Полный CRSF frame = 26 bytes.
-	frame := make([]byte, 26)
+	return payload
+}
+
+// ------------------------------------------------------------
+// Распаковка 22 байт обратно в 16 × 11 bit.
+//
+// Используется только для проверки упаковки.
+// ------------------------------------------------------------
+
+func unpackChannels(payload []byte) [16]uint16 {
+	var channels [16]uint16
+
+	if len(payload) < CRSFPayloadSize {
+		return channels
+	}
+
+	bitPos := 0
+
+	for channel := 0; channel < 16; channel++ {
+		var value uint16
+
+		for bit := 0; bit < 11; bit++ {
+			bytePos := bitPos / 8
+			bitOffset := bitPos % 8
+
+			if payload[bytePos]&(1<<bitOffset) != 0 {
+				value |= 1 << bit
+			}
+
+			bitPos++
+		}
+
+		channels[channel] = value
+	}
+
+	return channels
+}
+
+// ------------------------------------------------------------
+// Создание полного CRSF frame.
+//
+// 0     ADDRESS   C8
+// 1     LENGTH    18
+// 2     TYPE      16
+// 3..24 PAYLOAD   22 bytes
+// 25    CRC
+//
+// Всего = 26 байт.
+// ------------------------------------------------------------
+
+func makeCRSF(channels [16]uint16) []byte {
+	payload := packChannels(channels)
+
+	frame := make([]byte, CRSFFrameSize)
 
 	// Address.
-	frame[0] = 0xC8
+	frame[0] = CRSFAddress
 
-	// Length = TYPE + PAYLOAD + CRC
-	// 1 + 22 + 1 = 24 = 0x18.
+	// LENGTH:
+	//
+	// TYPE      = 1
+	// PAYLOAD   = 22
+	// CRC       = 1
+	//
+	// Итого 24 = 0x18.
 	frame[1] = 0x18
 
-	// RC Channels Packed.
-	frame[2] = 0x16
+	// Type.
+	frame[2] = CRSFTypeRC
 
 	// Payload.
-	copy(frame[3:25], payload)
+	copy(frame[3:25], payload[:])
 
-	// CRC считается начиная с TYPE.
+	// CRC считается от TYPE + PAYLOAD.
 	frame[25] = crc8(frame[2:25])
 
 	return frame
 }
 
-func printButtons(buttons uint32) {
-	fmt.Print("Buttons:")
+// ------------------------------------------------------------
+// Проверка полного CRSF frame.
+// ------------------------------------------------------------
 
-	found := false
+func validateCRSF(frame []byte) error {
+	if len(frame) != CRSFFrameSize {
+		return fmt.Errorf(
+			"неверный размер frame: %d, ожидается %d",
+			len(frame),
+			CRSFFrameSize,
+		)
+	}
 
-	for i := 0; i < 24; i++ {
-		if buttons&(1<<i) != 0 {
-			fmt.Printf(" %d", i+1)
-			found = true
+	// Проверяем address.
+	if frame[0] != CRSFAddress {
+		return fmt.Errorf(
+			"неверный ADDRESS: 0x%02X, ожидается 0x%02X",
+			frame[0],
+			CRSFAddress,
+		)
+	}
+
+	// Проверяем length.
+	if frame[1] != 0x18 {
+		return fmt.Errorf(
+			"неверный LENGTH: 0x%02X, ожидается 0x18",
+			frame[1],
+		)
+	}
+
+	// Проверяем type.
+	if frame[2] != CRSFTypeRC {
+		return fmt.Errorf(
+			"неверный TYPE: 0x%02X, ожидается 0x16",
+			frame[2],
+		)
+	}
+
+	// Рассчитываем CRC.
+	expectedCRC := crc8(frame[2:25])
+	actualCRC := frame[25]
+
+	if expectedCRC != actualCRC {
+		return fmt.Errorf(
+			"неверный CRC: получен 0x%02X, ожидается 0x%02X",
+			actualCRC,
+			expectedCRC,
+		)
+	}
+
+	return nil
+}
+
+// ------------------------------------------------------------
+// Проверка упаковки 16 × 11 bit.
+// ------------------------------------------------------------
+
+func validatePacking(channels [16]uint16, frame []byte) error {
+	if len(frame) != CRSFFrameSize {
+		return fmt.Errorf("неверный размер frame")
+	}
+
+	decoded := unpackChannels(frame[3:25])
+
+	for i := 0; i < 16; i++ {
+		expected := channels[i] & 0x07FF
+		actual := decoded[i]
+
+		if expected != actual {
+			return fmt.Errorf(
+				"ошибка CH%d: исходное=%d, распакованное=%d",
+				i+1,
+				expected,
+				actual,
+			)
 		}
 	}
 
-	if !found {
-		fmt.Print(" none")
-	}
-
-	fmt.Println()
+	return nil
 }
+
+// ------------------------------------------------------------
+// Вывод каналов.
+// ------------------------------------------------------------
 
 func printChannels(channels [16]uint16) {
 	fmt.Print("CRSF channels:")
@@ -215,15 +338,45 @@ func printChannels(channels [16]uint16) {
 	fmt.Println()
 }
 
-func printCRSF(frame []byte) {
-	fmt.Print("CRSF: ")
+// ------------------------------------------------------------
+// Вывод HEX.
+// ------------------------------------------------------------
 
-	for _, b := range frame {
-		fmt.Printf("%02X ", b)
+func printCRSF(frame []byte) {
+	fmt.Print("CRSF HEX: ")
+
+	for i, b := range frame {
+		fmt.Printf("%02X", b)
+
+		if i < len(frame)-1 {
+			fmt.Print(" ")
+		}
 	}
 
 	fmt.Println()
 }
+
+// ------------------------------------------------------------
+// Вывод payload отдельно.
+// ------------------------------------------------------------
+
+func printPayload(frame []byte) {
+	fmt.Print("PAYLOAD : ")
+
+	for i := 3; i < 25; i++ {
+		fmt.Printf("%02X", frame[i])
+
+		if i < 24 {
+			fmt.Print(" ")
+		}
+	}
+
+	fmt.Println()
+}
+
+// ------------------------------------------------------------
+// Основная программа.
+// ------------------------------------------------------------
 
 func main() {
 	devices := hid.Enumerate(VID, PID)
@@ -252,12 +405,22 @@ func main() {
 	fmt.Println()
 	fmt.Println("TX12 подключен")
 	fmt.Println()
+
 	fmt.Println("CRSF bridge:")
 	fmt.Println("  CH1 = Left X  = Rx")
 	fmt.Println("  CH2 = Left Y  = Z")
 	fmt.Println("  CH3 = Right X = X")
 	fmt.Println("  CH4 = Right Y = Y")
 	fmt.Println("  CH5..CH16 = 992")
+	fmt.Println()
+
+	fmt.Println("Проверки:")
+	fmt.Println("  Frame size : 26 bytes")
+	fmt.Println("  Payload    : 22 bytes")
+	fmt.Println("  Channels   : 16 × 11 bit")
+	fmt.Println("  Type       : 0x16")
+	fmt.Println("  Address    : 0xC8")
+	fmt.Println("  CRC        : CRC-8/D5")
 	fmt.Println()
 
 	buf := make([]byte, 64)
@@ -275,18 +438,14 @@ func main() {
 		report := parseReport(buf)
 
 		// ----------------------------------------------------
-		// Стики TX12
+		// Стики TX12.
 		// ----------------------------------------------------
 
-		// Левый стик:
-		// Horizontal = Rx
-		// Vertical   = Z
+		// Левый стик.
 		leftX := report.RX
 		leftY := report.Z
 
-		// Правый стик:
-		// Horizontal = X
-		// Vertical   = Y
+		// Правый стик.
 		rightX := report.X
 		rightY := report.Y
 
@@ -296,22 +455,33 @@ func main() {
 
 		var channels [16]uint16
 
-		// CH1-CH4.
 		channels[0] = hidToCRSF(leftX)
 		channels[1] = hidToCRSF(leftY)
 		channels[2] = hidToCRSF(rightX)
 		channels[3] = hidToCRSF(rightY)
 
-		// CH5-CH16 пока центр.
+		// CH5..CH16 = центр.
 		for i := 4; i < 16; i++ {
 			channels[i] = CRSFCenter
 		}
 
 		// ----------------------------------------------------
-		// Формируем настоящий CRSF frame.
+		// Создаём CRSF frame.
 		// ----------------------------------------------------
 
 		frame := makeCRSF(channels)
+
+		// ----------------------------------------------------
+		// Проверяем frame.
+		// ----------------------------------------------------
+
+		frameErr := validateCRSF(frame)
+
+		// ----------------------------------------------------
+		// Проверяем упаковку 16 × 11 bit.
+		// ----------------------------------------------------
+
+		packingErr := validatePacking(channels, frame)
 
 		// ----------------------------------------------------
 		// Вывод.
@@ -328,9 +498,30 @@ func main() {
 
 		printChannels(channels)
 
+		printPayload(frame)
+
 		printCRSF(frame)
 
-		printButtons(report.Buttons)
+		// ----------------------------------------------------
+		// Результат проверки.
+		// ----------------------------------------------------
+
+		if frameErr != nil {
+			fmt.Printf("FRAME CHECK: FAIL — %v\n", frameErr)
+		} else {
+			fmt.Println("FRAME CHECK: OK")
+		}
+
+		if packingErr != nil {
+			fmt.Printf("PACK CHECK : FAIL — %v\n", packingErr)
+		} else {
+			fmt.Println("PACK CHECK : OK")
+		}
+
+		fmt.Println(
+			"CRC        : 0x%02X",
+			frame[25],
+		)
 
 		fmt.Println()
 	}
