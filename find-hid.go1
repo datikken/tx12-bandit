@@ -1,0 +1,28 @@
+// package main
+
+// import (
+// 	"fmt"
+
+// 	"github.com/karalabe/hid"
+// 	"github.com/kr/pretty"
+// )
+
+// func main() {
+// 	devices := hid.Enumerate(0, 0)
+
+// 	fmt.Println("USB HID devices:")
+
+// 	for _, d := range devices {
+// 		pretty.Println(d)
+// 		fmt.Printf(
+// 			"VID=%04x PID=%04x  %s  %s\n",
+// 			d.VendorID,
+// 			d.ProductID,
+// 			d.Manufacturer,
+// 			d.Product,
+// 		)
+// 	}
+
+// 	fmt.Println()
+// 	fmt.Println("Найди здесь TX12 и запиши VID/PID.")
+// }
