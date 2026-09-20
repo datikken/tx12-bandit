@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/karalabe/hid"
+	"go.bug.st/serial"
 )
 
 const (
@@ -13,7 +15,7 @@ const (
 
 	ReportSize = 19
 
-	// HID axis range согласно Report Descriptor.
+	// HID axis range.
 	AxisMin = 0
 	AxisMax = 2047
 
@@ -26,10 +28,18 @@ const (
 	CRSFAddress = 0xC8
 	CRSFTypeRC  = 0x16
 
-	// CRSF RC Channels Packed:
 	// 16 channels × 11 bits = 176 bits = 22 bytes.
 	CRSFPayloadSize = 22
 	CRSFFrameSize   = 26
+
+	// UART.
+	UARTPort = "/dev/ttyUSB0"
+
+	// Standard CRSF UART speed.
+	UARTBaudRate = 420000
+
+	// Send CRSF at 200 Hz = every 5 ms.
+	CRSFInterval = 5 * time.Millisecond
 )
 
 type HIDReport struct {
@@ -129,15 +139,6 @@ func crc8(data []byte) byte {
 
 // ------------------------------------------------------------
 // Упаковка 16 × 11 bit.
-//
-// CRSF RC Channels Packed:
-//
-// CH1  = bits 0..10
-// CH2  = bits 11..21
-// ...
-// CH16 = bits 165..175
-//
-// Всего 176 бит = 22 байта.
 // ------------------------------------------------------------
 
 func packChannels(channels [16]uint16) [CRSFPayloadSize]byte {
@@ -165,8 +166,6 @@ func packChannels(channels [16]uint16) [CRSFPayloadSize]byte {
 
 // ------------------------------------------------------------
 // Распаковка 22 байт обратно в 16 × 11 bit.
-//
-// Используется только для проверки упаковки.
 // ------------------------------------------------------------
 
 func unpackChannels(payload []byte) [16]uint16 {
@@ -215,22 +214,10 @@ func makeCRSF(channels [16]uint16) []byte {
 
 	frame := make([]byte, CRSFFrameSize)
 
-	// Address.
 	frame[0] = CRSFAddress
-
-	// LENGTH:
-	//
-	// TYPE      = 1
-	// PAYLOAD   = 22
-	// CRC       = 1
-	//
-	// Итого 24 = 0x18.
 	frame[1] = 0x18
-
-	// Type.
 	frame[2] = CRSFTypeRC
 
-	// Payload.
 	copy(frame[3:25], payload[:])
 
 	// CRC считается от TYPE + PAYLOAD.
@@ -252,7 +239,6 @@ func validateCRSF(frame []byte) error {
 		)
 	}
 
-	// Проверяем address.
 	if frame[0] != CRSFAddress {
 		return fmt.Errorf(
 			"неверный ADDRESS: 0x%02X, ожидается 0x%02X",
@@ -261,7 +247,6 @@ func validateCRSF(frame []byte) error {
 		)
 	}
 
-	// Проверяем length.
 	if frame[1] != 0x18 {
 		return fmt.Errorf(
 			"неверный LENGTH: 0x%02X, ожидается 0x18",
@@ -269,7 +254,6 @@ func validateCRSF(frame []byte) error {
 		)
 	}
 
-	// Проверяем type.
 	if frame[2] != CRSFTypeRC {
 		return fmt.Errorf(
 			"неверный TYPE: 0x%02X, ожидается 0x16",
@@ -277,7 +261,6 @@ func validateCRSF(frame []byte) error {
 		)
 	}
 
-	// Рассчитываем CRC.
 	expectedCRC := crc8(frame[2:25])
 	actualCRC := frame[25]
 
@@ -293,7 +276,7 @@ func validateCRSF(frame []byte) error {
 }
 
 // ------------------------------------------------------------
-// Проверка упаковки 16 × 11 bit.
+// Проверка упаковки.
 // ------------------------------------------------------------
 
 func validatePacking(channels [16]uint16, frame []byte) error {
@@ -357,7 +340,7 @@ func printCRSF(frame []byte) {
 }
 
 // ------------------------------------------------------------
-// Вывод payload отдельно.
+// Вывод payload.
 // ------------------------------------------------------------
 
 func printPayload(frame []byte) {
@@ -375,17 +358,50 @@ func printPayload(frame []byte) {
 }
 
 // ------------------------------------------------------------
+// Формирование каналов из HID.
+// ------------------------------------------------------------
+
+func makeChannels(report HIDReport) [16]uint16 {
+	var channels [16]uint16
+
+	// Левый стик.
+	leftX := report.RX
+	leftY := report.Z
+
+	// Правый стик.
+	rightX := report.X
+	rightY := report.Y
+
+	// CH1..CH4.
+	channels[0] = hidToCRSF(leftX)
+	channels[1] = hidToCRSF(leftY)
+	channels[2] = hidToCRSF(rightX)
+	channels[3] = hidToCRSF(rightY)
+
+	// CH5..CH16 = центр.
+	for i := 4; i < 16; i++ {
+		channels[i] = CRSFCenter
+	}
+
+	return channels
+}
+
+// ------------------------------------------------------------
 // Основная программа.
 // ------------------------------------------------------------
 
 func main() {
+	// --------------------------------------------------------
+	// Открываем TX12 HID.
+	// --------------------------------------------------------
+
 	devices := hid.Enumerate(VID, PID)
 
 	if len(devices) == 0 {
 		log.Fatal("TX12 не найден")
 	}
 
-	fmt.Println("Найдено устройств:", len(devices))
+	fmt.Println("Найдено HID устройств:", len(devices))
 
 	for i, device := range devices {
 		fmt.Printf(
@@ -398,12 +414,44 @@ func main() {
 
 	d, err := devices[0].Open()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("не удалось открыть TX12: ", err)
 	}
 	defer d.Close()
 
+	// --------------------------------------------------------
+	// Открываем UART YP-05.
+	// --------------------------------------------------------
+
+	mode := &serial.Mode{
+		BaudRate: UARTBaudRate,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+
+	uart, err := serial.Open(UARTPort, mode)
+	if err != nil {
+		log.Fatal(
+			"не удалось открыть UART ",
+			UARTPort,
+			": ",
+			err,
+		)
+	}
+	defer uart.Close()
+
+	// --------------------------------------------------------
+	// Информация.
+	// --------------------------------------------------------
+
 	fmt.Println()
 	fmt.Println("TX12 подключен")
+	fmt.Println()
+
+	fmt.Println("UART:")
+	fmt.Println("  Port       :", UARTPort)
+	fmt.Println("  Baud       :", UARTBaudRate)
+	fmt.Println("  Format     : 8N1")
 	fmt.Println()
 
 	fmt.Println("CRSF bridge:")
@@ -414,115 +462,192 @@ func main() {
 	fmt.Println("  CH5..CH16 = 992")
 	fmt.Println()
 
-	fmt.Println("Проверки:")
-	fmt.Println("  Frame size : 26 bytes")
-	fmt.Println("  Payload    : 22 bytes")
+	fmt.Println("CRSF:")
+	fmt.Println("  Frame size :", CRSFFrameSize)
+	fmt.Println("  Payload    :", CRSFPayloadSize)
 	fmt.Println("  Channels   : 16 × 11 bit")
 	fmt.Println("  Type       : 0x16")
 	fmt.Println("  Address    : 0xC8")
 	fmt.Println("  CRC        : CRC-8/D5")
+	fmt.Println("  Rate       : 200 Hz")
 	fmt.Println()
+
+	fmt.Println("Запуск...")
+	fmt.Println()
+
+	// --------------------------------------------------------
+	// HID buffer.
+	// --------------------------------------------------------
 
 	buf := make([]byte, 64)
 
+	// --------------------------------------------------------
+	// Последние полученные каналы.
+	//
+	// HID и UART работают независимо:
+	//
+	// HID получает управление,
+	// UART отправляет его стабильно каждые 5 ms.
+	// --------------------------------------------------------
+
+	var channels [16]uint16
+
+	// Начальное состояние:
+	// все каналы по центру.
+	for i := 0; i < 16; i++ {
+		channels[i] = CRSFCenter
+	}
+
+	// --------------------------------------------------------
+	// Канал HID читаем в отдельной goroutine.
+	// --------------------------------------------------------
+
+	hidReports := make(chan HIDReport, 1)
+	hidErrors := make(chan error, 1)
+
+	go func() {
+		for {
+			n, err := d.Read(buf)
+
+			if err != nil {
+				hidErrors <- err
+				return
+			}
+
+			if n < ReportSize {
+				continue
+			}
+
+			// Копируем report, потому что buf переиспользуется.
+			reportData := make([]byte, n)
+			copy(reportData, buf[:n])
+
+			report := parseReport(reportData)
+
+			select {
+			case hidReports <- report:
+			default:
+				// Если UART ещё не обработал предыдущий report,
+				// старый report можно заменить следующим.
+				select {
+				case <-hidReports:
+				default:
+				}
+
+				hidReports <- report
+			}
+		}
+	}()
+
+	// --------------------------------------------------------
+	// UART ticker = 200 Hz.
+	// --------------------------------------------------------
+
+	ticker := time.NewTicker(CRSFInterval)
+	defer ticker.Stop()
+
+	var frameCounter uint64
+
 	for {
-		n, err := d.Read(buf)
-		if err != nil {
-			log.Fatal(err)
+		select {
+
+		// ----------------------------------------------------
+		// Новые данные от TX12.
+		// ----------------------------------------------------
+
+		case report := <-hidReports:
+
+			channels = makeChannels(report)
+
+		// ----------------------------------------------------
+		// Ошибка HID.
+		// ----------------------------------------------------
+
+		case err := <-hidErrors:
+
+			log.Fatal("ошибка HID: ", err)
+
+		// ----------------------------------------------------
+		// Каждые 5 ms отправляем CRSF.
+		// ----------------------------------------------------
+
+		case <-ticker.C:
+
+			frame := makeCRSF(channels)
+
+			// ------------------------------------------------
+			// Проверяем frame перед отправкой.
+			// ------------------------------------------------
+
+			frameErr := validateCRSF(frame)
+
+			if frameErr != nil {
+				log.Fatal("FRAME CHECK FAIL: ", frameErr)
+			}
+
+			packingErr := validatePacking(channels, frame)
+
+			if packingErr != nil {
+				log.Fatal("PACK CHECK FAIL: ", packingErr)
+			}
+
+			// ------------------------------------------------
+			// Отправляем ровно 26 байт в Bandit.
+			// ------------------------------------------------
+
+			n, err := uart.Write(frame)
+
+			if err != nil {
+				log.Fatal("ошибка записи UART: ", err)
+			}
+
+			if n != CRSFFrameSize {
+				log.Fatalf(
+					"UART записал %d байт, ожидалось %d",
+					n,
+					CRSFFrameSize,
+				)
+			}
+
+			frameCounter++
+
+			// ------------------------------------------------
+			// Выводим информацию не на каждый пакет,
+			// а примерно 10 раз в секунду,
+			// чтобы терминал не превратился в поток.
+			// ------------------------------------------------
+
+			if frameCounter%20 == 0 {
+
+				leftX := channels[0]
+				leftY := channels[1]
+				rightX := channels[2]
+				rightY := channels[3]
+
+				fmt.Printf(
+					"LEFT CRSF : X=%4d Y=%4d   "+
+						"RIGHT CRSF: X=%4d Y=%4d\n",
+					leftX,
+					leftY,
+					rightX,
+					rightY,
+				)
+
+				printChannels(channels)
+				printPayload(frame)
+				printCRSF(frame)
+
+				fmt.Printf(
+					"UART      : %d bytes sent | CRC=0x%02X | frame #%d\n",
+					n,
+					frame[25],
+					frameCounter,
+				)
+
+				fmt.Println(
+					"------------------------------------------------------------",
+				)
+			}
 		}
-
-		if n < ReportSize {
-			continue
-		}
-
-		report := parseReport(buf)
-
-		// ----------------------------------------------------
-		// Стики TX12.
-		// ----------------------------------------------------
-
-		// Левый стик.
-		leftX := report.RX
-		leftY := report.Z
-
-		// Правый стик.
-		rightX := report.X
-		rightY := report.Y
-
-		// ----------------------------------------------------
-		// Формируем 16 CRSF каналов.
-		// ----------------------------------------------------
-
-		var channels [16]uint16
-
-		channels[0] = hidToCRSF(leftX)
-		channels[1] = hidToCRSF(leftY)
-		channels[2] = hidToCRSF(rightX)
-		channels[3] = hidToCRSF(rightY)
-
-		// CH5..CH16 = центр.
-		for i := 4; i < 16; i++ {
-			channels[i] = CRSFCenter
-		}
-
-		// ----------------------------------------------------
-		// Создаём CRSF frame.
-		// ----------------------------------------------------
-
-		frame := makeCRSF(channels)
-
-		// ----------------------------------------------------
-		// Проверяем frame.
-		// ----------------------------------------------------
-
-		frameErr := validateCRSF(frame)
-
-		// ----------------------------------------------------
-		// Проверяем упаковку 16 × 11 bit.
-		// ----------------------------------------------------
-
-		packingErr := validatePacking(channels, frame)
-
-		// ----------------------------------------------------
-		// Вывод.
-		// ----------------------------------------------------
-
-		fmt.Printf(
-			"LEFT : X=%4d Y=%4d   "+
-				"RIGHT: X=%4d Y=%4d\n",
-			leftX,
-			leftY,
-			rightX,
-			rightY,
-		)
-
-		printChannels(channels)
-
-		printPayload(frame)
-
-		printCRSF(frame)
-
-		// ----------------------------------------------------
-		// Результат проверки.
-		// ----------------------------------------------------
-
-		if frameErr != nil {
-			fmt.Printf("FRAME CHECK: FAIL — %v\n", frameErr)
-		} else {
-			fmt.Println("FRAME CHECK: OK")
-		}
-
-		if packingErr != nil {
-			fmt.Printf("PACK CHECK : FAIL — %v\n", packingErr)
-		} else {
-			fmt.Println("PACK CHECK : OK")
-		}
-
-		fmt.Printf(
-			"CRC        : 0x%02X",
-			frame[25],
-		)
-
-		fmt.Println()
 	}
 }
