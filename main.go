@@ -518,7 +518,7 @@ func main() {
 			fmt.Println("PACK CHECK : OK")
 		}
 
-		fmt.Println(
+		fmt.Printf(
 			"CRC        : 0x%02X",
 			frame[25],
 		)
