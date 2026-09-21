@@ -1,9 +1,13 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"time"
+
+	"tx12-bandit/udpoutput"
 
 	"github.com/karalabe/hid"
 	"go.bug.st/serial"
@@ -226,6 +230,35 @@ func makeCRSF(channels [16]uint16) []byte {
 	return frame
 }
 
+func sendUART(uart io.Writer, frame []byte) (int, error) {
+	n, err := uart.Write(frame)
+	if err != nil {
+		return n, fmt.Errorf("ошибка записи UART: %w", err)
+	}
+
+	if n != CRSFFrameSize {
+		return n, fmt.Errorf(
+			"UART записал %d байт, ожидалось %d",
+			n,
+			CRSFFrameSize,
+		)
+	}
+
+	return n, nil
+}
+
+func sendUDP(udpSender *udpoutput.Sender, frame []byte) error {
+	if udpSender == nil {
+		return nil
+	}
+
+	if err := udpSender.Send(frame); err != nil {
+		return fmt.Errorf("ошибка записи UDP: %w", err)
+	}
+
+	return nil
+}
+
 // ------------------------------------------------------------
 // Проверка полного CRSF frame.
 // ------------------------------------------------------------
@@ -391,6 +424,10 @@ func makeChannels(report HIDReport) [16]uint16 {
 // ------------------------------------------------------------
 
 func main() {
+	udpEnabled := flag.Bool("udp-enabled", false, "отправлять CRSF-пакеты на UDP сервер")
+	udpAddress := flag.String("udp-address", "127.0.0.1:9000", "адрес UDP сервера")
+	flag.Parse()
+
 	// --------------------------------------------------------
 	// Открываем TX12 HID.
 	// --------------------------------------------------------
@@ -440,6 +477,15 @@ func main() {
 	}
 	defer uart.Close()
 
+	var udpSender *udpoutput.Sender
+	if *udpEnabled {
+		udpSender, err = udpoutput.New(*udpAddress)
+		if err != nil {
+			log.Fatal("не удалось подключить UDP модуль: ", err)
+		}
+		defer udpSender.Close()
+	}
+
 	// --------------------------------------------------------
 	// Информация.
 	// --------------------------------------------------------
@@ -460,6 +506,14 @@ func main() {
 	fmt.Println("  CH3 = Right X = X")
 	fmt.Println("  CH4 = Right Y = Y")
 	fmt.Println("  CH5..CH16 = 992")
+	fmt.Println()
+
+	fmt.Println("UDP:")
+	if udpSender == nil {
+		fmt.Println("  Disabled")
+	} else {
+		fmt.Println("  Enabled    :", *udpAddress)
+	}
 	fmt.Println()
 
 	fmt.Println("CRSF:")
@@ -592,21 +646,16 @@ func main() {
 			}
 
 			// ------------------------------------------------
-			// Отправляем ровно 26 байт в Bandit.
+			// Отправляем frame отдельно в UART и UDP.
 			// ------------------------------------------------
 
-			n, err := uart.Write(frame)
-
+			n, err := sendUART(uart, frame)
 			if err != nil {
-				log.Fatal("ошибка записи UART: ", err)
+				log.Fatal(err)
 			}
 
-			if n != CRSFFrameSize {
-				log.Fatalf(
-					"UART записал %d байт, ожидалось %d",
-					n,
-					CRSFFrameSize,
-				)
+			if err := sendUDP(udpSender, frame); err != nil {
+				log.Fatal(err)
 			}
 
 			frameCounter++
@@ -643,6 +692,9 @@ func main() {
 					frame[25],
 					frameCounter,
 				)
+				if udpSender != nil {
+					fmt.Println("UDP       : packet sent")
+				}
 
 				fmt.Println(
 					"------------------------------------------------------------",
