@@ -1,12 +1,14 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/karalabe/hid"
 	"go.bug.st/serial"
+
+	"tx12-bandit/logger"
 )
 
 const (
@@ -15,32 +17,30 @@ const (
 
 	ReportSize = 19
 
-	// HID axis range.
 	AxisMin = 0
 	AxisMax = 2047
 
-	// CRSF RC channel range.
 	CRSFMin    = 172
 	CRSFCenter = 992
 	CRSFMax    = 1811
 
-	// CRSF frame.
 	CRSFAddress = 0xC8
 	CRSFTypeRC  = 0x16
 
-	// 16 channels × 11 bits = 176 bits = 22 bytes.
 	CRSFPayloadSize = 22
 	CRSFFrameSize   = 26
 
-	// UART.
-	UARTPort = "/dev/ttyUSB0"
-
-	// Standard CRSF UART speed.
+	UARTPort     = "/dev/ttyUSB0"
 	UARTBaudRate = 420000
 
-	// Send CRSF at 200 Hz = every 5 ms.
 	CRSFInterval = 5 * time.Millisecond
+
+	LoopbackReadTimeout = 20 * time.Millisecond
 )
+
+// ============================================================
+// HID REPORT
+// ============================================================
 
 type HIDReport struct {
 	Buttons uint32
@@ -55,6 +55,10 @@ type HIDReport struct {
 	Slider1 uint16
 	Slider2 uint16
 }
+
+// ============================================================
+// HID
+// ============================================================
 
 func u16LE(buf []byte, offset int) uint16 {
 	return uint16(buf[offset]) |
@@ -71,6 +75,10 @@ func clampAxis(v uint16) uint16 {
 
 func parseReport(buf []byte) HIDReport {
 	var r HIDReport
+
+	if len(buf) < ReportSize {
+		return r
+	}
 
 	// 24 buttons = 3 bytes.
 	r.Buttons =
@@ -92,32 +100,27 @@ func parseReport(buf []byte) HIDReport {
 	return r
 }
 
-// ------------------------------------------------------------
-// HID 0..2047 -> CRSF 172..1811
-//
-// HID:
-//   0    -> 172
-//   1024 -> 992
-//   2047 -> 1811
-// ------------------------------------------------------------
+// ============================================================
+// HID -> CRSF
+// ============================================================
 
 func hidToCRSF(v uint16) uint16 {
 	if v <= 1024 {
 		return uint16(
-			CRSFMin +
+			CRSFMin+
 				int(v)*int(CRSFCenter-CRSFMin)/1024,
 		)
 	}
 
 	return uint16(
-		CRSFCenter +
+		CRSFCenter+
 			int(v-1024)*int(CRSFMax-CRSFCenter)/(2047-1024),
 	)
 }
 
-// ------------------------------------------------------------
-// CRSF CRC-8/D5
-// ------------------------------------------------------------
+// ============================================================
+// CRC-8/D5
+// ============================================================
 
 func crc8(data []byte) byte {
 	var crc byte
@@ -137,9 +140,9 @@ func crc8(data []byte) byte {
 	return crc
 }
 
-// ------------------------------------------------------------
-// Упаковка 16 × 11 bit.
-// ------------------------------------------------------------
+// ============================================================
+// CRSF PACK
+// ============================================================
 
 func packChannels(channels [16]uint16) [CRSFPayloadSize]byte {
 	var payload [CRSFPayloadSize]byte
@@ -164,9 +167,9 @@ func packChannels(channels [16]uint16) [CRSFPayloadSize]byte {
 	return payload
 }
 
-// ------------------------------------------------------------
-// Распаковка 22 байт обратно в 16 × 11 bit.
-// ------------------------------------------------------------
+// ============================================================
+// CRSF UNPACK
+// ============================================================
 
 func unpackChannels(payload []byte) [16]uint16 {
 	var channels [16]uint16
@@ -197,17 +200,9 @@ func unpackChannels(payload []byte) [16]uint16 {
 	return channels
 }
 
-// ------------------------------------------------------------
-// Создание полного CRSF frame.
-//
-// 0     ADDRESS   C8
-// 1     LENGTH    18
-// 2     TYPE      16
-// 3..24 PAYLOAD   22 bytes
-// 25    CRC
-//
-// Всего = 26 байт.
-// ------------------------------------------------------------
+// ============================================================
+// CREATE CRSF FRAME
+// ============================================================
 
 func makeCRSF(channels [16]uint16) []byte {
 	payload := packChannels(channels)
@@ -220,15 +215,15 @@ func makeCRSF(channels [16]uint16) []byte {
 
 	copy(frame[3:25], payload[:])
 
-	// CRC считается от TYPE + PAYLOAD.
+	// CRC = TYPE + PAYLOAD.
 	frame[25] = crc8(frame[2:25])
 
 	return frame
 }
 
-// ------------------------------------------------------------
-// Проверка полного CRSF frame.
-// ------------------------------------------------------------
+// ============================================================
+// VALIDATE CRSF
+// ============================================================
 
 func validateCRSF(frame []byte) error {
 	if len(frame) != CRSFFrameSize {
@@ -275,9 +270,9 @@ func validateCRSF(frame []byte) error {
 	return nil
 }
 
-// ------------------------------------------------------------
-// Проверка упаковки.
-// ------------------------------------------------------------
+// ============================================================
+// VALIDATE PACKING
+// ============================================================
 
 func validatePacking(channels [16]uint16, frame []byte) error {
 	if len(frame) != CRSFFrameSize {
@@ -303,72 +298,18 @@ func validatePacking(channels [16]uint16, frame []byte) error {
 	return nil
 }
 
-// ------------------------------------------------------------
-// Вывод каналов.
-// ------------------------------------------------------------
-
-func printChannels(channels [16]uint16) {
-	fmt.Print("CRSF channels:")
-
-	for i, channel := range channels {
-		fmt.Printf(
-			" CH%d=%4d",
-			i+1,
-			channel,
-		)
-	}
-
-	fmt.Println()
-}
-
-// ------------------------------------------------------------
-// Вывод HEX.
-// ------------------------------------------------------------
-
-func printCRSF(frame []byte) {
-	fmt.Print("CRSF HEX: ")
-
-	for i, b := range frame {
-		fmt.Printf("%02X", b)
-
-		if i < len(frame)-1 {
-			fmt.Print(" ")
-		}
-	}
-
-	fmt.Println()
-}
-
-// ------------------------------------------------------------
-// Вывод payload.
-// ------------------------------------------------------------
-
-func printPayload(frame []byte) {
-	fmt.Print("PAYLOAD : ")
-
-	for i := 3; i < 25; i++ {
-		fmt.Printf("%02X", frame[i])
-
-		if i < 24 {
-			fmt.Print(" ")
-		}
-	}
-
-	fmt.Println()
-}
-
-// ------------------------------------------------------------
-// Формирование каналов из HID.
-// ------------------------------------------------------------
+// ============================================================
+// HID -> CHANNELS
+// ============================================================
 
 func makeChannels(report HIDReport) [16]uint16 {
 	var channels [16]uint16
 
-	// Левый стик.
+	// Left stick.
 	leftX := report.RX
 	leftY := report.Z
 
-	// Правый стик.
+	// Right stick.
 	rightX := report.X
 	rightY := report.Y
 
@@ -378,7 +319,7 @@ func makeChannels(report HIDReport) [16]uint16 {
 	channels[2] = hidToCRSF(rightX)
 	channels[3] = hidToCRSF(rightY)
 
-	// CH5..CH16 = центр.
+	// CH5..CH16 = center.
 	for i := 4; i < 16; i++ {
 		channels[i] = CRSFCenter
 	}
@@ -386,11 +327,481 @@ func makeChannels(report HIDReport) [16]uint16 {
 	return channels
 }
 
-// ------------------------------------------------------------
-// Основная программа.
-// ------------------------------------------------------------
+// ============================================================
+// COMPARE FRAMES
+// ============================================================
 
-func main() {
+func compareFrames(expected []byte, actual []byte) error {
+	if len(expected) != len(actual) {
+		return fmt.Errorf(
+			"разный размер: TX=%d RX=%d",
+			len(expected),
+			len(actual),
+		)
+	}
+
+	for i := 0; i < len(expected); i++ {
+		if expected[i] != actual[i] {
+			return fmt.Errorf(
+				"различие на byte[%d]: TX=0x%02X RX=0x%02X",
+				i,
+				expected[i],
+				actual[i],
+			)
+		}
+	}
+
+	return nil
+}
+
+// ============================================================
+// READ CRSF FRAME FROM UART STREAM
+//
+// UART является потоком байтов.
+// Read() НЕ обязан начинаться с начала CRSF frame.
+//
+// Поэтому ищем:
+//
+//     C8 18 16
+//
+// Затем проверяем полный 26-byte frame и CRC.
+//
+// Это исправляет ситуацию:
+//
+//     RX: 07 3E F0 ... AD C8 18 16 ...
+//
+// когда физический loopback работает, но Read()
+// начал чтение не с первого байта пакета.
+// ============================================================
+
+func readCRSFFrame(
+	uart serial.Port,
+	timeout time.Duration,
+) ([]byte, error) {
+
+	if err := uart.SetReadTimeout(2 * time.Millisecond); err != nil {
+		return nil, fmt.Errorf(
+			"не удалось установить UART read timeout: %w",
+			err,
+		)
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	stream := make([]byte, 0, CRSFFrameSize*2)
+	tmp := make([]byte, 64)
+
+	for time.Now().Before(deadline) {
+
+		n, err := uart.Read(tmp)
+
+		if err != nil {
+			return nil, fmt.Errorf(
+				"ошибка UART Read: %w",
+				err,
+			)
+		}
+
+		if n == 0 {
+			continue
+		}
+
+		stream = append(stream, tmp[:n]...)
+
+		// ----------------------------------------------------
+		// Ищем полный 26-byte CRSF frame.
+		// ----------------------------------------------------
+
+		for i := 0; i+CRSFFrameSize <= len(stream); i++ {
+
+			// ADDRESS
+			if stream[i] != CRSFAddress {
+				continue
+			}
+
+			// LENGTH
+			if stream[i+1] != 0x18 {
+				continue
+			}
+
+			// TYPE
+			if stream[i+2] != CRSFTypeRC {
+				continue
+			}
+
+			// Полный frame.
+			candidate := stream[i : i+CRSFFrameSize]
+
+			// Проверяем CRC.
+			if err := validateCRSF(candidate); err != nil {
+				continue
+			}
+
+			// Копируем найденный frame.
+			frame := make([]byte, CRSFFrameSize)
+
+			copy(frame, candidate)
+
+			return frame, nil
+		}
+
+		// ----------------------------------------------------
+		// Сохраняем последние 25 байт.
+		//
+		// Это нужно, если начало frame оказалось
+		// разделено между двумя Read().
+		// ----------------------------------------------------
+
+		if len(stream) > CRSFFrameSize-1 {
+
+			stream = append(
+				[]byte(nil),
+				stream[len(stream)-(CRSFFrameSize-1):]...,
+			)
+		}
+	}
+
+	return nil, fmt.Errorf(
+		"timeout: CRSF frame не найден за %s",
+		timeout,
+	)
+}
+
+// ============================================================
+// PHYSICAL UART LOOPBACK TEST
+//
+// TX -> physical wire -> RX
+//
+// TX12 НЕ ИСПОЛЬЗУЕТСЯ.
+// ============================================================
+
+func runUARTLoopback(uart serial.Port) {
+
+	logger.Logger.Header("CRSF UART LOOPBACK TEST")
+
+	logger.Logger.Info("TX12      : DISABLED")
+	logger.Logger.Info("UART      : %s", UARTPort)
+	logger.Logger.Info("BAUD      : %d", UARTBaudRate)
+	logger.Logger.Info("FORMAT    : 8N1")
+	logger.Logger.Info("RATE      : 200 Hz")
+	logger.Logger.Info("INTERVAL  : %s", CRSFInterval)
+
+	var channels [16]uint16
+
+	for i := 0; i < 16; i++ {
+		channels[i] = CRSFCenter
+	}
+
+	logger.Logger.Info("TEST CHANNELS:")
+	logger.Logger.Channels(channels)
+
+	// --------------------------------------------------------
+	// Создаём frame.
+	// --------------------------------------------------------
+
+	frame := makeCRSF(channels)
+
+	// --------------------------------------------------------
+	// Проверяем TX frame.
+	// --------------------------------------------------------
+
+	if err := validateCRSF(frame); err != nil {
+		logger.Logger.Fatal(
+			"TX FRAME CHECK FAIL: %v",
+			err,
+		)
+	}
+
+	if err := validatePacking(channels, frame); err != nil {
+		logger.Logger.Fatal(
+			"TX PACK CHECK FAIL: %v",
+			err,
+		)
+	}
+
+	logger.Logger.Info("TX FRAME:")
+	logger.Logger.CRSF("TX", frame)
+
+	logger.Logger.Info(
+		"TX SIZE : %d bytes",
+		len(frame),
+	)
+
+	logger.Logger.Info(
+		"TX CRC  : 0x%02X",
+		frame[25],
+	)
+
+	// --------------------------------------------------------
+	// Очищаем RX/TX buffers.
+	// --------------------------------------------------------
+
+	if err := uart.ResetInputBuffer(); err != nil {
+		logger.Logger.Fatal(
+			"не удалось очистить UART RX buffer: %v",
+			err,
+		)
+	}
+
+	if err := uart.ResetOutputBuffer(); err != nil {
+		logger.Logger.Fatal(
+			"не удалось очистить UART TX buffer: %v",
+			err,
+		)
+	}
+
+	// --------------------------------------------------------
+	// PHYSICAL LOOPBACK CHECK
+	// --------------------------------------------------------
+
+	logger.Logger.Separator()
+	logger.Logger.Info("PHYSICAL LOOPBACK CHECK")
+	logger.Logger.Separator()
+
+	logger.Logger.Info(
+		"Отправляем %d байт через TX...",
+		CRSFFrameSize,
+	)
+
+	n, err := uart.Write(frame)
+
+	if err != nil {
+		logger.Logger.Fatal(
+			"ошибка записи UART: %v",
+			err,
+		)
+	}
+
+	if n != CRSFFrameSize {
+		logger.Logger.Fatal(
+			"UART записал %d байт, ожидалось %d",
+			n,
+			CRSFFrameSize,
+		)
+	}
+
+	logger.Logger.Info(
+		"TX SENT : %d bytes",
+		n,
+	)
+
+	// --------------------------------------------------------
+	// Читаем UART как поток.
+	//
+	// НЕ используем readExact().
+	// --------------------------------------------------------
+
+	rxFrame, err := readCRSFFrame(
+		uart,
+		LoopbackReadTimeout,
+	)
+
+	if err != nil {
+
+		logger.Logger.Error(
+			"RX ERROR: %v",
+			err,
+		)
+
+		logger.Logger.Error(
+			"Проверь физическое соединение:",
+		)
+
+		logger.Logger.Error(
+			"  USB-UART TX  --->  RX",
+		)
+
+		logger.Logger.Error(
+			"  USB-UART RX  <---  TX",
+		)
+
+		logger.Logger.Fatal(
+			"физический UART loopback не получен",
+		)
+	}
+
+	logger.Logger.Info(
+		"RX RECV : %d bytes",
+		len(rxFrame),
+	)
+
+	logger.Logger.CRSF(
+		"RX",
+		rxFrame,
+	)
+
+	// --------------------------------------------------------
+	// Проверяем RX CRSF.
+	// --------------------------------------------------------
+
+	if err := validateCRSF(rxFrame); err != nil {
+
+		logger.Logger.Fatal(
+			"RX FRAME CHECK FAIL: %v",
+			err,
+		)
+	}
+
+	logger.Logger.Info(
+		"RX FRAME CHECK : OK",
+	)
+
+	// --------------------------------------------------------
+	// Сравниваем TX и RX.
+	// --------------------------------------------------------
+
+	if err := compareFrames(
+		frame,
+		rxFrame,
+	); err != nil {
+
+		logger.Logger.Error(
+			"FRAME MATCH : NO",
+		)
+
+		logger.Logger.Error(
+			"ERROR       : %v",
+			err,
+		)
+
+		logger.Logger.Info("TX:")
+		logger.Logger.CRSF("TX", frame)
+
+		logger.Logger.Info("RX:")
+		logger.Logger.CRSF("RX", rxFrame)
+
+		logger.Logger.Fatal(
+			"UART LOOPBACK FRAME DIFFERENT",
+		)
+	}
+
+	logger.Logger.Info(
+		"FRAME MATCH : YES",
+	)
+
+	// --------------------------------------------------------
+	// Проверяем packing.
+	// --------------------------------------------------------
+
+	if err := validatePacking(
+		channels,
+		rxFrame,
+	); err != nil {
+
+		logger.Logger.Fatal(
+			"RX PACK CHECK FAIL: %v",
+			err,
+		)
+	}
+
+	logger.Logger.Info(
+		"RX PACK CHECK : OK",
+	)
+
+	logger.Logger.Info(
+		"RX CRC : OK",
+	)
+
+	logger.Logger.Info(
+		"RX CRC : 0x%02X",
+		rxFrame[25],
+	)
+
+	// --------------------------------------------------------
+	// LOOPBACK TEST PASSED.
+	// --------------------------------------------------------
+
+	logger.Logger.Header(
+		"UART LOOPBACK TEST PASSED",
+	)
+
+	logger.Logger.Info(
+		"26/26 bytes identical.",
+	)
+
+	logger.Logger.Info(
+		"TX == RX",
+	)
+
+	logger.Logger.Info(
+		"CRSF synchronization : OK",
+	)
+
+	logger.Logger.Info(
+		"CRC valid.",
+	)
+
+	logger.Logger.Info(
+		"Physical TX -> RX loopback : OK",
+	)
+
+	// --------------------------------------------------------
+	// CONTINUOUS TRANSMISSION
+	//
+	// Отправляем один и тот же frame каждые 5 ms.
+	// TX12 не используется.
+	// --------------------------------------------------------
+
+	logger.Logger.Info(
+		"Начинаем непрерывную передачу...",
+	)
+
+	logger.Logger.Info(
+		"Отправляется один и тот же CRSF frame:",
+	)
+
+	logger.Logger.CRSF(
+		"CRSF",
+		frame,
+	)
+
+	ticker := time.NewTicker(
+		CRSFInterval,
+	)
+
+	defer ticker.Stop()
+
+	var frameCounter uint64
+
+	for range ticker.C {
+
+		n, err := uart.Write(frame)
+
+		if err != nil {
+			logger.Logger.Fatal(
+				"ошибка записи UART: %v",
+				err,
+			)
+		}
+
+		if n != CRSFFrameSize {
+			logger.Logger.Fatal(
+				"UART записал %d байт, ожидалось %d",
+				n,
+				CRSFFrameSize,
+			)
+		}
+
+		frameCounter++
+
+		if frameCounter%20 == 0 {
+
+			logger.Logger.Info(
+				"LOOPBACK TX: frame #%d | %d bytes | CRC=0x%02X",
+				frameCounter,
+				n,
+				frame[25],
+			)
+		}
+	}
+}
+
+// ============================================================
+// NORMAL HID MODE
+// ============================================================
+
+func runHIDMode(uart serial.Port) {
+
 	// --------------------------------------------------------
 	// Открываем TX12 HID.
 	// --------------------------------------------------------
@@ -398,14 +809,20 @@ func main() {
 	devices := hid.Enumerate(VID, PID)
 
 	if len(devices) == 0 {
-		log.Fatal("TX12 не найден")
+		logger.Logger.Fatal(
+			"TX12 не найден",
+		)
 	}
 
-	fmt.Println("Найдено HID устройств:", len(devices))
+	logger.Logger.Info(
+		"Найдено HID устройств: %d",
+		len(devices),
+	)
 
 	for i, device := range devices {
-		fmt.Printf(
-			"[%d] %s - %s\n",
+
+		logger.Logger.Info(
+			"[%d] %s - %s",
 			i,
 			device.Manufacturer,
 			device.Product,
@@ -413,67 +830,97 @@ func main() {
 	}
 
 	d, err := devices[0].Open()
+
 	if err != nil {
-		log.Fatal("не удалось открыть TX12: ", err)
-	}
-	defer d.Close()
-
-	// --------------------------------------------------------
-	// Открываем UART YP-05.
-	// --------------------------------------------------------
-
-	mode := &serial.Mode{
-		BaudRate: UARTBaudRate,
-		DataBits: 8,
-		Parity:   serial.NoParity,
-		StopBits: serial.OneStopBit,
-	}
-
-	uart, err := serial.Open(UARTPort, mode)
-	if err != nil {
-		log.Fatal(
-			"не удалось открыть UART ",
-			UARTPort,
-			": ",
+		logger.Logger.Fatal(
+			"не удалось открыть TX12: %v",
 			err,
 		)
 	}
-	defer uart.Close()
+
+	defer d.Close()
+
+	logger.Logger.Info(
+		"TX12 подключен",
+	)
 
 	// --------------------------------------------------------
-	// Информация.
+	// Configuration.
 	// --------------------------------------------------------
 
-	fmt.Println()
-	fmt.Println("TX12 подключен")
-	fmt.Println()
+	logger.Logger.Info("UART:")
 
-	fmt.Println("UART:")
-	fmt.Println("  Port       :", UARTPort)
-	fmt.Println("  Baud       :", UARTBaudRate)
-	fmt.Println("  Format     : 8N1")
-	fmt.Println()
+	logger.Logger.Info(
+		"  Port       : %s",
+		UARTPort,
+	)
 
-	fmt.Println("CRSF bridge:")
-	fmt.Println("  CH1 = Left X  = Rx")
-	fmt.Println("  CH2 = Left Y  = Z")
-	fmt.Println("  CH3 = Right X = X")
-	fmt.Println("  CH4 = Right Y = Y")
-	fmt.Println("  CH5..CH16 = 992")
-	fmt.Println()
+	logger.Logger.Info(
+		"  Baud       : %d",
+		UARTBaudRate,
+	)
 
-	fmt.Println("CRSF:")
-	fmt.Println("  Frame size :", CRSFFrameSize)
-	fmt.Println("  Payload    :", CRSFPayloadSize)
-	fmt.Println("  Channels   : 16 × 11 bit")
-	fmt.Println("  Type       : 0x16")
-	fmt.Println("  Address    : 0xC8")
-	fmt.Println("  CRC        : CRC-8/D5")
-	fmt.Println("  Rate       : 200 Hz")
-	fmt.Println()
+	logger.Logger.Info(
+		"  Format     : 8N1",
+	)
 
-	fmt.Println("Запуск...")
-	fmt.Println()
+	logger.Logger.Info("CRSF bridge:")
+
+	logger.Logger.Info(
+		"  CH1 = Left X  = RX",
+	)
+
+	logger.Logger.Info(
+		"  CH2 = Left Y  = Z",
+	)
+
+	logger.Logger.Info(
+		"  CH3 = Right X = X",
+	)
+
+	logger.Logger.Info(
+		"  CH4 = Right Y = Y",
+	)
+
+	logger.Logger.Info(
+		"  CH5..CH16 = 992",
+	)
+
+	logger.Logger.Info("CRSF:")
+
+	logger.Logger.Info(
+		"  Frame size : %d",
+		CRSFFrameSize,
+	)
+
+	logger.Logger.Info(
+		"  Payload    : %d",
+		CRSFPayloadSize,
+	)
+
+	logger.Logger.Info(
+		"  Channels   : 16 × 11 bit",
+	)
+
+	logger.Logger.Info(
+		"  Type       : 0x16",
+	)
+
+	logger.Logger.Info(
+		"  Address    : 0xC8",
+	)
+
+	logger.Logger.Info(
+		"  CRC        : CRC-8/D5",
+	)
+
+	logger.Logger.Info(
+		"  Rate       : 200 Hz",
+	)
+
+	logger.Logger.Info(
+		"Запуск...",
+	)
 
 	// --------------------------------------------------------
 	// HID buffer.
@@ -482,35 +929,29 @@ func main() {
 	buf := make([]byte, 64)
 
 	// --------------------------------------------------------
-	// Последние полученные каналы.
-	//
-	// HID и UART работают независимо:
-	//
-	// HID получает управление,
-	// UART отправляет его стабильно каждые 5 ms.
+	// HID reports.
 	// --------------------------------------------------------
 
-	var channels [16]uint16
+	hidReports := make(
+		chan HIDReport,
+		1,
+	)
 
-	// Начальное состояние:
-	// все каналы по центру.
-	for i := 0; i < 16; i++ {
-		channels[i] = CRSFCenter
-	}
-
-	// --------------------------------------------------------
-	// Канал HID читаем в отдельной goroutine.
-	// --------------------------------------------------------
-
-	hidReports := make(chan HIDReport, 1)
-	hidErrors := make(chan error, 1)
+	hidErrors := make(
+		chan error,
+		1,
+	)
 
 	go func() {
+
 		for {
+
 			n, err := d.Read(buf)
 
 			if err != nil {
+
 				hidErrors <- err
+
 				return
 			}
 
@@ -518,17 +959,26 @@ func main() {
 				continue
 			}
 
-			// Копируем report, потому что buf переиспользуется.
-			reportData := make([]byte, n)
-			copy(reportData, buf[:n])
+			reportData := make(
+				[]byte,
+				n,
+			)
 
-			report := parseReport(reportData)
+			copy(
+				reportData,
+				buf[:n],
+			)
+
+			report := parseReport(
+				reportData,
+			)
 
 			select {
+
 			case hidReports <- report:
+
 			default:
-				// Если UART ещё не обработал предыдущий report,
-				// старый report можно заменить следующим.
+
 				select {
 				case <-hidReports:
 				default:
@@ -540,24 +990,40 @@ func main() {
 	}()
 
 	// --------------------------------------------------------
+	// Initial channels.
+	// --------------------------------------------------------
+
+	var channels [16]uint16
+
+	for i := 0; i < 16; i++ {
+		channels[i] = CRSFCenter
+	}
+
+	// --------------------------------------------------------
 	// UART ticker = 200 Hz.
 	// --------------------------------------------------------
 
-	ticker := time.NewTicker(CRSFInterval)
+	ticker := time.NewTicker(
+		CRSFInterval,
+	)
+
 	defer ticker.Stop()
 
 	var frameCounter uint64
 
 	for {
+
 		select {
 
 		// ----------------------------------------------------
-		// Новые данные от TX12.
+		// Новые данные TX12.
 		// ----------------------------------------------------
 
 		case report := <-hidReports:
 
-			channels = makeChannels(report)
+			channels = makeChannels(
+				report,
+			)
 
 		// ----------------------------------------------------
 		// Ошибка HID.
@@ -565,7 +1031,10 @@ func main() {
 
 		case err := <-hidErrors:
 
-			log.Fatal("ошибка HID: ", err)
+			logger.Logger.Fatal(
+				"ошибка HID: %v",
+				err,
+			)
 
 		// ----------------------------------------------------
 		// Каждые 5 ms отправляем CRSF.
@@ -573,22 +1042,27 @@ func main() {
 
 		case <-ticker.C:
 
-			frame := makeCRSF(channels)
+			frame := makeCRSF(
+				channels,
+			)
 
-			// ------------------------------------------------
-			// Проверяем frame перед отправкой.
-			// ------------------------------------------------
+			if err := validateCRSF(frame); err != nil {
 
-			frameErr := validateCRSF(frame)
-
-			if frameErr != nil {
-				log.Fatal("FRAME CHECK FAIL: ", frameErr)
+				logger.Logger.Fatal(
+					"FRAME CHECK FAIL: %v",
+					err,
+				)
 			}
 
-			packingErr := validatePacking(channels, frame)
+			if err := validatePacking(
+				channels,
+				frame,
+			); err != nil {
 
-			if packingErr != nil {
-				log.Fatal("PACK CHECK FAIL: ", packingErr)
+				logger.Logger.Fatal(
+					"PACK CHECK FAIL: %v",
+					err,
+				)
 			}
 
 			// ------------------------------------------------
@@ -598,11 +1072,16 @@ func main() {
 			n, err := uart.Write(frame)
 
 			if err != nil {
-				log.Fatal("ошибка записи UART: ", err)
+
+				logger.Logger.Fatal(
+					"ошибка записи UART: %v",
+					err,
+				)
 			}
 
 			if n != CRSFFrameSize {
-				log.Fatalf(
+
+				logger.Logger.Fatal(
 					"UART записал %d байт, ожидалось %d",
 					n,
 					CRSFFrameSize,
@@ -612,42 +1091,110 @@ func main() {
 			frameCounter++
 
 			// ------------------------------------------------
-			// Выводим информацию не на каждый пакет,
-			// а примерно 10 раз в секунду,
-			// чтобы терминал не превратился в поток.
+			// Диагностика примерно 10 раз в секунду.
 			// ------------------------------------------------
 
 			if frameCounter%20 == 0 {
 
-				leftX := channels[0]
-				leftY := channels[1]
-				rightX := channels[2]
-				rightY := channels[3]
-
-				fmt.Printf(
-					"LEFT CRSF : X=%4d Y=%4d   "+
-						"RIGHT CRSF: X=%4d Y=%4d\n",
-					leftX,
-					leftY,
-					rightX,
-					rightY,
+				logger.Logger.Info(
+					"LEFT CRSF : X=%4d Y=%4d | RIGHT CRSF: X=%4d Y=%4d",
+					channels[0],
+					channels[1],
+					channels[2],
+					channels[3],
 				)
 
-				printChannels(channels)
-				printPayload(frame)
-				printCRSF(frame)
+				logger.Logger.Channels(
+					channels,
+				)
 
-				fmt.Printf(
-					"UART      : %d bytes sent | CRC=0x%02X | frame #%d\n",
+				logger.Logger.Payload(
+					frame,
+				)
+
+				logger.Logger.CRSF(
+					"CRSF HEX",
+					frame,
+				)
+
+				logger.Logger.Info(
+					"UART      : %d bytes sent | CRC=0x%02X | frame #%d",
 					n,
 					frame[25],
 					frameCounter,
 				)
 
-				fmt.Println(
-					"------------------------------------------------------------",
-				)
+				logger.Logger.Separator()
 			}
 		}
 	}
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+func main() {
+
+	// --------------------------------------------------------
+	// FLAGS
+	// --------------------------------------------------------
+
+	loopback := flag.Bool(
+		"loopback",
+		false,
+		"физический UART loopback без TX12: TX -> RX и проверка 26 байт",
+	)
+
+	flag.Parse()
+
+	// --------------------------------------------------------
+	// UART CONFIGURATION
+	// --------------------------------------------------------
+
+	mode := &serial.Mode{
+		BaudRate: UARTBaudRate,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+
+	// --------------------------------------------------------
+	// OPEN UART
+	// --------------------------------------------------------
+
+	uart, err := serial.Open(
+		UARTPort,
+		mode,
+	)
+
+	if err != nil {
+
+		logger.Logger.Fatal(
+			"не удалось открыть UART %s: %v",
+			UARTPort,
+			err,
+		)
+	}
+
+	defer uart.Close()
+
+	// --------------------------------------------------------
+	// LOOPBACK MODE
+	//
+	// TX12 здесь вообще НЕ открывается.
+	// --------------------------------------------------------
+
+	if *loopback {
+
+		runUARTLoopback(uart)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// NORMAL HID MODE
+	// --------------------------------------------------------
+
+	runHIDMode(uart)
 }
